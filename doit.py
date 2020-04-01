@@ -9,8 +9,8 @@ import time
 
 import pdb
 
-long_delay = 30
-short_delay = 1
+long_delay = 3600
+short_delay = 5
 
 holidayObj = holidays.US(state = 'UT')
 includedHolidays = [
@@ -23,36 +23,9 @@ includedHolidays = [
     "Christmas Day",
 ]
 
-def createDbConnection(db_file):
-    try:
-        return sqlite3.connect(db_file)
-    except sqlite3.Error as e:
-        print(e)
-
-def createTable(db, sql):
-    try:
-        cursor = db.cursor()
-        cursor.execute(sql)
-        db.commit()
-    except sqlite3.Error as e:
-        print(e)
-
 def weekend(localtime):
     return localtime.weekday() >= 5
-
-def offPeakHour(localtime):
-    hour = localtime.hour
-
-    if hour < 8 or (hour >= 10 and hour < 15) or hour >= 20:
-        #Summer or winter, these hours are off - peak
-        return True
-
-    month = localtime.month
-    if month > 4 and month < 10 and hour < 15:
-        #Summer before 3 PM
-        return True
-
-    return False
+    #return False
 
 def getHoliday(localtime):
     return holidayObj.get(localtime.strftime('%Y-%m-%d'));
@@ -73,111 +46,67 @@ def powerHoliday(localtime):
 
     return False
 
-def cheapPower(localtime):
-    print "Offpeakhour", offPeakHour(localtime)
-    print "Weekend", weekend(localtime)
-    print "Holiday", powerHoliday(localtime)
+# Return next off-peak interval in the form of (start hour, start min,
+# end hour, end min).
+def nextOffPeakInterval(localtime):
+    hour = localtime.hour
 
-    return (offPeakHour(localtime) or
-            weekend(localtime) or
-            powerHoliday(localtime))
+    # Default the charge interval to from 8:01 PM to 2:59 PM, so we
+    # won't charge from 3:00 PM to 8:00 PM
+    default = 20, 1, 14, 59
 
-createHistoryTableSql = """
-    CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY,
-        time TIMESTAMP DEFAULT (strftime('%s', 'now')),
-        status TEXT,
-        sessionTime INTEGER,
-        sessionWh REAL,
-        lifeWh INTEGER,
-        currentAmps REAL,
-        ampLimit INTEGER,
-        voltage INTEGER DEFAULT 247,
-        temperature REAL
-    );
-"""
+    month = localtime.month
+    # On winter mornings, though, we instead use 10:01 AM to 7:59 AM,
+    # so we won't charge from 8:00 AM to 10:00 AM.  This is obviously
+    # wrong when 3:00 PM rolls around, but we should have checked
+    # again and changed to the default interval by then.
+    if hour < 10 and (month < 5 or month > 9):
+        return 10, 1, 7, 59
 
-insertSql  = """
-    INSERT INTO history(
-        status,
-        sessionTime,
-        sessionWh,
-        lifeWh,
-        currentAmps,
-        ampLimit,
-        temperature
-    ) VALUES (?, ?, ?, ?, ?, ?, ?);
-"""
+    return default
 
-def updateIfNeeded(name, evse, cheap_power, db):
+def update(name, evse, chargeTimer):
     try:
-        status = evse.status()
-        ampLimit = evse.current_capacity()
-        currentAmps = evse.charging_current_and_voltage()['amps']
-        temperature = evse.temperature()['tmp007temp'];
-        sessionTime = 0
-        sessionWh = 0
-        if status == 'charging':
-            try:
-                elapsed = evse.elapsed()
-                sessionTime = elapsed['seconds']
-                sessionWh = elapsed['Wh']
-            except NotCharging:
-                pass
-        lifeWh = evse.accumulated_wh()
-    except:
+        print "%s is %s" % (name, evse.status())
+        evse_time = evse.time()
+        sys_time = datetime.datetime.now()
+        diff = abs(sys_time - evse_time).total_seconds()
+        if diff > 10:
+            print "%s clock is off by %d seconds. Updating" % (name, diff)
+            evse.time(sys_time)
+
+        starthour, startmin, endhour, endmin = chargeTimer
+        evse.timer(starthour, startmin, endhour, endmin)
+
+    except Exception as err:
         print "Unable to communicate with %s!" % name
+        print err
         return short_delay
 
-    if db is not None:
-        cursor = db.cursor()
-        cursor.execute(insertSql,
-                       (status, sessionTime, sessionWh, lifeWh, currentAmps,
-                        ampLimit, temperature))
-        db.commit()
-
-    print name + " is " + status
-    if not cheap_power and status != 'sleeping':
-        print "Wasting money!  Disabling " + name + " charger!"
-        evse.status('sleep')
-        return short_delay
-    elif cheap_power and status == 'sleeping':
-        print "Wasting charging opportunity!  Enabling " + name + " charger!"
-        evse.status('enable')
-        return short_delay
-    else:
-        return long_delay
+    return long_delay
 
 if __name__ == "__main__":
     tesla = openevse.WifiOpenEVSE('192.168.86.177', 'admin', 'hikingisfun')
     leaf = openevse.WifiOpenEVSE('192.168.86.178', 'admin', 'hikingisfun')
 
-    teslaDb = createDbConnection("db/tesla.db");
-    createTable(teslaDb, createHistoryTableSql);
-    leafDb = createDbConnection("db/leaf.db");
-    createTable(leafDb, createHistoryTableSql);
-
     while True:
         localtime = datetime.datetime.now()
-        cheap_power = cheapPower(localtime)
+        print "Time: ", localtime
 
-#        pdb.set_trace()
-
-        print localtime
-        if cheap_power:
-            print "Power is cheap"
+        chargeTimer = 0, 0, 0, 0
+        if weekend(localtime):
+            print "This is a weekend, power is cheap!"
+        elif powerHoliday(localtime):
+            print "This is a holiday, power is cheap!"
         else:
-            print "Power is expensive"
+            chargeTimer = nextOffPeakInterval(localtime)
 
-        tesla_delay = updateIfNeeded("Tesla", tesla, cheap_power, teslaDb)
-        leaf_delay = updateIfNeeded("Leaf", leaf, cheap_power, leafDb)
-        print
+        print "Charge interval", chargeTimer
 
-        minute_delay = long_delay
-        if localtime.minute == 59:
-            minute_delay = 61 - localtime.second
+        tesla_delay = update("Tesla", tesla, chargeTimer)
+        leaf_delay = update("Leaf", leaf, chargeTimer)
 
-        to_wait = min(tesla_delay, leaf_delay, minute_delay)
+        to_wait = min(tesla_delay, leaf_delay, long_delay)
 
         print "waiting " + str(to_wait)
         print
